@@ -60,3 +60,98 @@ def test_managed_exit_75_requeues_rate_limited_not_crashed(conn, bound_claim, ex
     assert outcome == expected
     assert (tid in kbd.detect_crashed_workers._last_rate_limited) is (expected == "rate_limited")
     assert (tid in crashed) is (expected == "crashed")
+
+
+def test_rate_limit_reset_survives_managed_reclaim(conn):
+    import json
+    import time
+
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="reset-aware retry", assignee="w")
+    task = kb.claim_task(conn, tid, claimer=f"{host}:owner")
+    assert task is not None
+
+    submitter, interpreter = _dead_pid(), _dead_pid()
+    kbd._set_worker_pid(conn, tid, submitter)
+
+    reset_at = time.time() + 3600
+
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, tid, "worker_bound",
+            {"pid": interpreter, "claim_lock": task.claim_lock},
+            run_id=task.current_run_id,
+        )
+        kb._append_event(
+            conn, tid, "worker_result",
+            {
+                "pid": interpreter,
+                "claim_lock": task.claim_lock,
+                "exit_code": kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+                "last_output": "",
+                "retry": {
+                    "version": 1,
+                    "reason": "rate_limit",
+                    "not_before": reset_at,
+                    "deadline_source": "provider_reset",
+                },
+            },
+            run_id=task.current_run_id,
+        )
+
+    kbd.detect_crashed_workers(conn)
+
+    row = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE id=?",
+        (task.current_run_id,),
+    ).fetchone()
+
+    assert row["outcome"] == "rate_limited"
+    metadata = json.loads(row["metadata"])
+    assert metadata["retry"]["not_before"] == reset_at
+
+
+def test_rate_limit_guard_respects_provider_reset(conn, monkeypatch):
+    import time
+
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="reset guard", assignee="w")
+    task = kb.claim_task(conn, tid, claimer=f"{host}:owner")
+    assert task is not None
+
+    submitter, interpreter = _dead_pid(), _dead_pid()
+    kbd._set_worker_pid(conn, tid, submitter)
+
+    ended_at = int(time.time())
+    reset_at = ended_at + 3600
+
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, tid, "worker_bound",
+            {"pid": interpreter, "claim_lock": task.claim_lock},
+            run_id=task.current_run_id,
+        )
+        kb._append_event(
+            conn, tid, "worker_result",
+            {
+                "pid": interpreter,
+                "claim_lock": task.claim_lock,
+                "exit_code": kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+                "last_output": "",
+                "retry": {
+                    "version": 1,
+                    "reason": "rate_limit",
+                    "not_before": reset_at,
+                    "deadline_source": "provider_reset",
+                },
+            },
+            run_id=task.current_run_id,
+        )
+
+    kbd.detect_crashed_workers(conn)
+
+    monkeypatch.setattr(kbd.time, "time", lambda: ended_at + 301)
+    assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+    monkeypatch.setattr(kbd.time, "time", lambda: reset_at + 11)
+    assert kbd.check_respawn_guard(conn, tid) is None

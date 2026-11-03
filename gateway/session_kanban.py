@@ -275,7 +275,7 @@ def _run_worker_turns(agent, frame, history):
                                           **({'task_id': task_id} if task_id else {}),
                                           **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
-    code, last_output = 1, ''
+    code, last_output, result = 1, '', None
     try:
         result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
@@ -285,7 +285,7 @@ def _run_worker_turns(agent, frame, history):
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
         raise
     finally:
-        _record_worker_result(context, code, last_output)
+        _record_worker_result(context, code, last_output, result)
 
 
 def record_start_failure(frame, exc):
@@ -298,7 +298,7 @@ def record_start_failure(frame, exc):
     _record_worker_result(context, turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc)), '')
 
 
-def _record_worker_result(context, code, last_output):
+def _record_worker_result(context, code, last_output, result=None):
     _TURNS_DONE.set()
     import os
     from hermes_cli.kanban_db_connect import connect_closing
@@ -307,9 +307,31 @@ def _record_worker_result(context, code, last_output):
         if _bound_worker_matches(conn, context):
             # Closing a run clears its claim/PID and replaces metadata; keep the
             # result in the immutable attempt event stream instead.
-            kb._append_event(conn, context['task_id'], 'worker_result',
-                {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
-                 'last_output': last_output}, run_id=context['run_id'])
+            payload = {
+                'pid': os.getpid(), 'claim_lock': context['claim_lock'],
+                'exit_code': code, 'last_output': last_output,
+            }
+            if code == kb.KANBAN_RATE_LIMIT_EXIT_CODE and isinstance(result, dict):
+                import math
+                import time
+                reset_at = result.get('failure_resets_at')
+                now = time.time()
+                if (
+                    isinstance(reset_at, (int, float))
+                    and not isinstance(reset_at, bool)
+                    and math.isfinite(reset_at)
+                    and now < reset_at <= now + 7 * 86400
+                ):
+                    payload['retry'] = {
+                        'version': 1,
+                        'reason': 'rate_limit',
+                        'not_before': reset_at,
+                        'deadline_source': 'provider_reset',
+                    }
+            kb._append_event(
+                conn, context['task_id'], 'worker_result',
+                payload, run_id=context['run_id'],
+            )
 
 
 def _bound_worker_matches(conn, context):

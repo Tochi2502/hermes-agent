@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import math
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -1173,7 +1174,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import managed_run_exit_code, owner_reclaim_blocked
+        from hermes_cli.kanban_owner_recovery import managed_run_result, owner_reclaim_blocked
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1192,8 +1193,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
-            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
+            managed_result = managed_run_result(conn, row["id"], pid, row["claim_lock"])
+            exit_code = managed_result.get("exit_code")
             dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            if dead.rate_limited and isinstance(managed_result.get("retry"), dict):
+                dead.event_payload["retry"] = managed_result["retry"]
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1602,16 +1606,30 @@ def check_respawn_guard(
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
-        if rl_cooldown <= 0:
-            # Cooldown disabled — respawn immediately, skipping blocker_auth so
-            # the stamped rate-limit text doesn't re-trap the task.
-            return None
         ended_at = _kb._to_epoch(latest_run["ended_at"])
-        if ended_at is not None and (now - ended_at) < rl_cooldown:
-            return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        retry = _kb._json_dict(latest_run["metadata"]).get("retry")
+
+        if (
+            isinstance(retry, dict)
+            and type(retry.get("version")) is int
+            and retry["version"] == 1
+            and retry.get("reason") == "rate_limit"
+            and retry.get("deadline_source") == "provider_reset"
+        ):
+            deadline = retry.get("not_before")
+            if (
+                isinstance(deadline, (int, float))
+                and not isinstance(deadline, bool)
+                and math.isfinite(deadline)
+                and ended_at is not None
+                and ended_at < deadline <= ended_at + 7 * 86400
+                and now < deadline + 10
+            ):
+                return "rate_limit_cooldown"
+
+        if rl_cooldown > 0 and ended_at is not None:
+            if (now - ended_at) < rl_cooldown:
+                return "rate_limit_cooldown"
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain

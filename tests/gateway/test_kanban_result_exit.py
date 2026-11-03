@@ -75,3 +75,58 @@ def test_managed_start_failure_books_the_one_shot_credential_exit(tmp_path, monk
 
     session_kanban.record_start_failure(frame, error)
     assert session_kanban.worker_exit_code(path, context) == expected
+
+
+@pytest.mark.parametrize(
+    "failure_reason, reset_value, expected_retry",
+    [
+        ("rate_limit", 3600, True),
+        ("rate_limit", -60, False),
+        ("rate_limit", 9 * 86400, False),
+        ("rate_limit", True, False),
+        ("rate_limit", float("nan"), False),
+        ("auth", 3600, False),
+    ],
+)
+def test_managed_worker_result_provider_reset_metadata(
+    tmp_path, monkeypatch, failure_reason, reset_value, expected_retry,
+):
+    import time
+    from hermes_cli.kanban_owner_recovery import _latest_run_event
+
+    path, context = _bound_claim(tmp_path, monkeypatch)
+
+    reset_at = (
+        time.time() + reset_value
+        if isinstance(reset_value, (int, float))
+        and not isinstance(reset_value, bool)
+        else reset_value
+    )
+
+    result = {
+        "failed": True,
+        "failure_reason": failure_reason,
+        "failure_resets_at": reset_at,
+    }
+    monkeypatch.setattr(
+        session_kanban, "_run_task_turns", lambda *_args: result,
+    )
+
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+    session_kanban.run_worker_turns(SimpleNamespace(), frame, [])
+
+    with connect_closing(path) as conn:
+        event = _latest_run_event(
+            conn, context["task_id"], "worker_result",
+        )
+
+    assert event is not None
+    assert ("retry" in event) is expected_retry
+
+    if expected_retry:
+        assert event["retry"] == {
+            "version": 1,
+            "reason": "rate_limit",
+            "not_before": reset_at,
+            "deadline_source": "provider_reset",
+        }

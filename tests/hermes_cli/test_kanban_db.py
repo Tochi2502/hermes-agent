@@ -2082,3 +2082,64 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+@pytest.mark.parametrize(
+    "retry, cooldown, offset, expected",
+    [
+        ({"deadline_source": "provider_reset", "not_before": 3600}, "300", 400, "rate_limit_cooldown"),
+        ({"deadline_source": "provider_reset", "not_before": 3600}, "0", 400, "rate_limit_cooldown"),
+        ({"deadline_source": "provider_reset", "not_before": 3600}, "300", 3611, None),
+        ({"deadline_source": "provider_reset", "not_before": True}, "300", 400, None),
+        ({"deadline_source": "provider_reset", "not_before": "3600"}, "300", 400, None),
+        ({"deadline_source": "provider_reset", "not_before": 8 * 86400}, "300", 400, None),
+        ({"deadline_source": "unknown", "not_before": 3600}, "300", 400, None),
+        ({"version": 2, "not_before": 3600}, "300", 400, None),
+        ({"version": True, "not_before": 3600}, "300", 400, None),
+        ({"reason": "auth", "not_before": 3600}, "300", 400, None),
+        ({"reason": None, "not_before": 3600}, "300", 400, None),
+        (None, "300", 100, "rate_limit_cooldown"),
+        (None, "300", 400, None),
+    ],
+)
+def test_respawn_guard_provider_reset_edge_cases(
+    kanban_home, monkeypatch, retry, cooldown, offset, expected,
+):
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    base = 5_000_000
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", cooldown)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="provider-reset-edge", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        metadata = {}
+        if retry is not None:
+            metadata["retry"] = {
+                "version": 1,
+                "reason": "rate_limit",
+                **retry,
+            }
+            if isinstance(retry.get("not_before"), (int, float)) and not isinstance(
+                retry.get("not_before"), bool
+            ):
+                metadata["retry"]["not_before"] = base + retry["not_before"]
+
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=?, metadata=? WHERE id=?",
+            (base, json.dumps(metadata), run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("rate-limited quota wall", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: base + offset)
+        assert kbd.check_respawn_guard(conn, tid) == expected
